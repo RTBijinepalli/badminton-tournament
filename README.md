@@ -8,13 +8,21 @@ A single-file web app for managing doubles badminton tournaments with 30 players
 
 ## Quick Start
 
+### Run it on phones over Wi-Fi (shared, live scores)
+
+Needs Node 18+ on the computer. No `npm install`.
+
 ```bash
-# Local dev — serve the directory on any port
-npx serve -l 8080
-# Open http://localhost:8080/tournament-v2.html
+node server.js
 ```
 
-No build tools, no dependencies (except SheetJS and Supabase CDNs). Just a single HTML file.
+It prints a Wi-Fi address such as `http://192.168.1.23:8080`. Open that on any phone on the same Wi-Fi. Every phone shares one copy of the tournament and updates live; scores entered on two phones at once are merged. Data is saved in `data/` on the computer, so it survives restarts. Use `?t=<name>` to run more than one tournament (e.g. `?t=tuesday`).
+
+On a Mac, click **Allow** if asked whether Node may accept incoming connections.
+
+### Single device only
+
+Open `index.html` in a browser. Everything is saved in that browser.
 
 **Page routing**: Use hash URLs to link directly to any page — e.g. `#qr1`, `#dashboard`.
 

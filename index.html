@@ -2121,12 +2121,101 @@ const _supabaseClient = (function() {
   return null;
 })();
 
+// Sync backends. Each one offers the same calls:
+//   get()                      -> { state, version } or null if none yet
+//   create(state)              -> stores version 1 (throws on failure)
+//   update(state, version)     -> new version, or null if someone else wrote first
+//   subscribe(onChange, onStatus)
+// The Wi-Fi server (server.js) is used when it served this page; otherwise
+// Supabase if configured; otherwise the app saves only in this browser.
+
+function wifiBackend() {
+  const base = '/api/tournaments/' + encodeURIComponent(TOURNAMENT_ID);
+  const json = { 'Content-Type': 'application/json' };
+  return {
+    async get() {
+      const r = await fetch(base, { cache: 'no-store' });
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error('Load failed: ' + r.status);
+      return r.json();
+    },
+    async create(st) {
+      const r = await fetch(base, { method: 'POST', headers: json, body: JSON.stringify({ state: st }) });
+      if (!r.ok) throw new Error('Create failed: ' + r.status);
+    },
+    async update(st, version) {
+      const r = await fetch(base, { method: 'PUT', headers: json, body: JSON.stringify({ state: st, version }) });
+      if (r.status === 409) return null;
+      if (!r.ok) throw new Error('Save failed: ' + r.status);
+      return (await r.json()).version;
+    },
+    subscribe(onChange, onStatus) {
+      // EventSource reconnects by itself and the server re-sends the latest copy.
+      const es = new EventSource(base + '/events');
+      es.onopen = () => onStatus(true);
+      es.onerror = () => onStatus(false);
+      es.onmessage = (e) => { const d = JSON.parse(e.data); onChange(d.state, d.version); };
+    },
+  };
+}
+
+function supabaseBackend(client) {
+  const table = () => client.from('tournaments');
+  return {
+    async get() {
+      const { data, error } = await table().select('state, version').eq('id', TOURNAMENT_ID).maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+    async create(st) {
+      const { error } = await table().insert({ id: TOURNAMENT_ID, state: st, version: 1 });
+      if (error) throw error;
+    },
+    async update(st, version) {
+      const { data, error } = await table()
+        .update({ state: st, version: version + 1, updated_at: new Date().toISOString() })
+        .eq('id', TOURNAMENT_ID)
+        .eq('version', version)
+        .select('version')
+        .single();
+      return (error || !data) ? null : data.version;
+    },
+    subscribe(onChange, onStatus) {
+      client
+        .channel('tournament-' + TOURNAMENT_ID)
+        .on('postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'tournaments', filter: 'id=eq.' + TOURNAMENT_ID },
+          (payload) => onChange(payload.new.state, payload.new.version))
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') onStatus(true);
+          else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') onStatus(false);
+        });
+    },
+  };
+}
+
+let _backend = null;
+let _serverInfo = null; // from the Wi-Fi server: { lanUrls: [...] }
+
+async function detectBackend() {
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    try {
+      const r = await fetch('/api/health', { cache: 'no-store' });
+      if (r.ok) {
+        const info = await r.json();
+        if (info && info.app === 'badminton-tournament') { _serverInfo = info; return wifiBackend(); }
+      }
+    } catch (e) { /* not served by server.js */ }
+  }
+  return _supabaseClient ? supabaseBackend(_supabaseClient) : null;
+}
+
 // Sync state
 let _remoteVersion = 0;
 let _syncEnabled = false;
 let _pushing = false;
-let _subscription = null;
 let _pushQueue = null; // queued push while one is in-flight
+let _unsynced = false; // a save failed to reach the server; retry on reconnect
 
 function showSyncBadge(status) {
   const el = document.getElementById('syncBadge');
@@ -2140,8 +2229,16 @@ function showSyncBadge(status) {
   el.title = el.textContent;
 }
 
-async function pushStateToSupabase() {
-  if (!_syncEnabled || !_supabaseClient) return;
+function stateForSync() {
+  // Strip UI-only keys before sending
+  const s = Object.assign({}, state);
+  delete s._activeQR1Group;
+  delete s._activeQR2Pool;
+  return s;
+}
+
+async function pushState() {
+  if (!_syncEnabled || !_backend) return;
   if (_pushing) {
     _pushQueue = true; // mark that another push is needed
     return;
@@ -2149,58 +2246,37 @@ async function pushStateToSupabase() {
   _pushing = true;
   _pushQueue = null;
 
-  // Strip UI-only keys before sending
-  const stateToSend = Object.assign({}, state);
-  delete stateToSend._activeQR1Group;
-  delete stateToSend._activeQR2Pool;
-
-  const nextVersion = _remoteVersion + 1;
   try {
-    const { data, error } = await _supabaseClient
-      .from('tournaments')
-      .update({
-        state: stateToSend,
-        version: nextVersion,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', TOURNAMENT_ID)
-      .eq('version', _remoteVersion)
-      .select('version')
-      .single();
-
-    if (error || !data) {
+    const version = await _backend.update(stateForSync(), _remoteVersion);
+    if (version === null) {
       // Version conflict — another client wrote first. Merge their state with
       // our newer per-match edits, then push again.
       console.warn('Sync conflict, merging remote state');
       await pullAndMerge();
       _pushQueue = true;
     } else {
-      _remoteVersion = data.version;
+      _remoteVersion = version;
+      _unsynced = false;
     }
   } catch (e) {
     console.warn('Push failed:', e);
+    _unsynced = true;
     showSyncBadge('offline');
   } finally {
     _pushing = false;
     // If another save happened while we were pushing, push again
     if (_pushQueue) {
       _pushQueue = null;
-      pushStateToSupabase();
+      pushState();
     }
   }
 }
 
 async function pullAndMerge() {
-  if (!_supabaseClient) return;
+  if (!_backend) return;
   try {
-    const { data, error } = await _supabaseClient
-      .from('tournaments')
-      .select('state, version')
-      .eq('id', TOURNAMENT_ID)
-      .single();
-
-    if (error || !data) return;
-
+    const data = await _backend.get();
+    if (!data) return;
     applyRemoteState(data.state, data.version);
     showSyncBadge('connected');
   } catch(e) {
@@ -2253,65 +2329,36 @@ function withPreservedInputs(render) {
 }
 
 function subscribeToChanges() {
-  if (!_supabaseClient || _subscription) return;
-
-  _subscription = _supabaseClient
-    .channel('tournament-' + TOURNAMENT_ID)
-    .on(
-      'postgres_changes',
-      {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'tournaments',
-        filter: 'id=eq.' + TOURNAMENT_ID
-      },
-      (payload) => {
-        const remote = payload.new;
-        // Ignore if we already have this version (our own write)
-        if (remote.version <= _remoteVersion) return;
-        applyRemoteState(remote.state, remote.version);
-      }
-    )
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') showSyncBadge('connected');
-      else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') showSyncBadge('offline');
-    });
+  _backend.subscribe(
+    (remoteState, version) => {
+      // Ignore if we already have this version (our own write)
+      if (version <= _remoteVersion) return;
+      applyRemoteState(remoteState, version);
+    },
+    (online) => {
+      showSyncBadge(online ? 'connected' : 'offline');
+      if (online && _unsynced) pushState(); // retry saves made while disconnected
+    }
+  );
 }
 
-async function initSupabase() {
-  if (!_supabaseClient) {
-    // Supabase not configured — hide badge or show offline
-    if (SUPABASE_URL === 'https://YOUR_PROJECT.supabase.co') {
-      // Not configured at all — don't show badge
-      const el = document.getElementById('syncBadge');
-      if (el) el.style.display = 'none';
-    }
+async function initSync() {
+  _backend = await detectBackend();
+  if (!_backend) {
+    // No sync configured — this browser only, so hide the badge
+    const el = document.getElementById('syncBadge');
+    if (el) el.style.display = 'none';
     return;
   }
 
   showSyncBadge('syncing');
 
   try {
-    // Try to fetch existing tournament
-    const { data, error } = await _supabaseClient
-      .from('tournaments')
-      .select('state, version')
-      .eq('id', TOURNAMENT_ID)
-      .maybeSingle();
-
-    if (error) throw error;
+    const data = await _backend.get();
 
     if (!data) {
       // Tournament doesn't exist yet — create from current local state
-      const stateToSend = Object.assign({}, state);
-      delete stateToSend._activeQR1Group;
-      delete stateToSend._activeQR2Pool;
-
-      const { error: insertErr } = await _supabaseClient
-        .from('tournaments')
-        .insert({ id: TOURNAMENT_ID, state: stateToSend, version: 1 });
-
-      if (insertErr) throw insertErr;
+      await _backend.create(stateForSync());
       _remoteVersion = 1;
       _syncEnabled = true;
     } else {
@@ -2330,16 +2377,17 @@ async function initSupabase() {
     subscribeToChanges();
     showSyncBadge('connected');
   } catch (e) {
-    console.warn('Supabase init failed, using localStorage fallback:', e);
+    console.warn('Sync init failed, using localStorage fallback:', e);
     showSyncBadge('offline');
   }
 }
 
 // Offline/online handlers
 window.addEventListener('online', async () => {
-  if (_supabaseClient && _syncEnabled) {
+  if (_backend && _syncEnabled) {
     showSyncBadge('syncing');
     await pullAndMerge();
+    if (_unsynced) pushState();
   }
 });
 window.addEventListener('offline', () => {
@@ -2347,7 +2395,12 @@ window.addEventListener('offline', () => {
 });
 
 function shareTournament() {
-  const url = window.location.origin + window.location.pathname + '?t=' + TOURNAMENT_ID + window.location.hash;
+  // On the computer running server.js, "localhost" means nothing to a phone,
+  // so share the Wi-Fi address instead.
+  let origin = window.location.origin;
+  const isLocal = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname);
+  if (isLocal && _serverInfo && _serverInfo.lanUrls && _serverInfo.lanUrls.length) origin = _serverInfo.lanUrls[0];
+  const url = origin + window.location.pathname + '?t=' + TOURNAMENT_ID + window.location.hash;
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(url).then(() => {
       toast('Tournament link copied! Share with players to view live scores.', 'success');
@@ -2475,7 +2528,7 @@ function saveStateLocal() {
 function saveState() {
   saveStateLocal();
   if (_syncEnabled) {
-    pushStateToSupabase();
+    pushState();
   }
 }
 
@@ -4886,7 +4939,7 @@ if (state.players.length === 0) {
 
 renderAll();
 applyRoute();
-initSupabase(); // async — boots from localStorage first, then syncs with Supabase
+initSync(); // async — boots from localStorage first, then syncs (Wi-Fi server or Supabase)
 </script>
 </body>
 </html>
