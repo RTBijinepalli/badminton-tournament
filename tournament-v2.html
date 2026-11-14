@@ -2099,8 +2099,10 @@ function logout() {
 
 // Supabase config — anon key is public-safe (RLS protects data)
 // Replace these with your own Supabase project credentials
-const SUPABASE_URL  = 'https://pgizfgionqetgyqvjums.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBnaXpmZ2lvbnFldGd5cXZqdW1zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1NDY1MDYsImV4cCI6MjA4OTEyMjUwNn0.iroc0Ln-RkmqaVf-7ZikcrZe7Behlv9NrmuLByp8lt4';
+// Sync is off: this copy saves only in the browser on each device.
+// To turn on multi-device sync, put your own Supabase project URL and anon key here.
+const SUPABASE_URL  = 'https://YOUR_PROJECT.supabase.co';
+const SUPABASE_ANON_KEY = 'YOUR_ANON_KEY';
 
 // Tournament ID from URL: e.g., ?t=spring2026
 function getTournamentId() {
