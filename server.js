@@ -3,8 +3,12 @@
 // network and keeps one shared copy of each tournament on this computer.
 // No dependencies, just Node 18+.
 //
-//   node server.js              start on port 8080
-//   PORT=3000 node server.js    pick another port
+//   node server.js                                   start on port 8080
+//   ADMIN_PIN=1234 SUPER_ADMIN_PIN=5678 node server.js  set your own PINs
+//   PORT=3000 node server.js                         pick another port
+//
+// Admin PINs are checked here, not in the page. Saves without a correct PIN
+// are refused; anyone on the network can still view.
 //
 // Tournaments are saved as JSON files in ./data (one per ?t= tournament id).
 
@@ -18,6 +22,19 @@ const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const MAX_BODY = 5 * 1024 * 1024;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const PINS = { super_admin: process.env.SUPER_ADMIN_PIN || '2809', admin: process.env.ADMIN_PIN || '2025' };
+const DEFAULT_PINS = !process.env.ADMIN_PIN || !process.env.SUPER_ADMIN_PIN;
+
+// After 20 wrong PINs in 10 minutes, PIN checks pause for everyone.
+let pinFailures = [];
+function roleForPin(pin) {
+  const now = Date.now();
+  pinFailures = pinFailures.filter(t => now - t < 10 * 60 * 1000);
+  if (pinFailures.length >= 20) return { locked: true };
+  const role = pin && pin === PINS.super_admin ? 'super_admin' : pin && pin === PINS.admin ? 'admin' : null;
+  if (!role) pinFailures.push(now);
+  return { role };
+}
 
 // Only these files are served, so ./data and .git stay private.
 const STATIC = {
@@ -108,6 +125,12 @@ async function handle(req, res) {
     return send(res, 200, { app: 'badminton-tournament', lanUrls: lanUrls() });
   }
 
+  if (req.method === 'POST' && p === '/api/check-pin') {
+    const body = await readJson(req);
+    const r = roleForPin(body && String(body.pin || ''));
+    return r.locked ? send(res, 429, { error: 'too many wrong PINs' }) : send(res, 200, { role: r.role });
+  }
+
   const m = p.match(/^\/api\/tournaments\/([^/]+)(\/events)?$/);
   if (!m) return send(res, 404, { error: 'not found' });
   const id = decodeURIComponent(m[1]);
@@ -130,6 +153,12 @@ async function handle(req, res) {
   if (req.method === 'GET') {
     const t = load(id);
     return t ? send(res, 200, t) : send(res, 404, { error: 'no such tournament' });
+  }
+
+  if (req.method === 'POST' || req.method === 'PUT') {
+    const r = roleForPin(req.headers['x-admin-pin']);
+    if (r.locked) return send(res, 429, { error: 'too many wrong PINs' });
+    if (!r.role) return send(res, 401, { error: 'admin PIN required' });
   }
 
   if (req.method === 'POST') { // create
@@ -186,5 +215,6 @@ server.listen(PORT, () => {
     console.log('  No Wi-Fi address found. Is this computer connected to a network?');
   }
   console.log(`\nTournaments are saved in ${DATA_DIR}`);
+  if (DEFAULT_PINS) console.log('Using the default admin PINs. Set your own with ADMIN_PIN=.... SUPER_ADMIN_PIN=.... node server.js');
   console.log('Press Ctrl+C to stop.\n');
 });

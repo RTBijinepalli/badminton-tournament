@@ -1975,9 +1975,15 @@ function setTheme(pref) {
 themeMQ.addEventListener('change', () => { if (getThemePref() === 'system') applyTheme('system'); });
 applyTheme(getThemePref());
 
-const ADMIN_PIN = '2025';  // Change this to your desired PIN
-const SUPER_ADMIN_PIN = '2809';  // Super admin PIN — grants reset access
+// Admin PINs are checked by the sync backend (Supabase or server.js), never in
+// this page, so reading the page source doesn't reveal them. These two are used
+// only when the app runs with no sync at all (opened as a file on one device),
+// where there is nothing shared to protect.
+const LOCAL_ADMIN_PIN = '2025';
+const LOCAL_SUPER_ADMIN_PIN = '2809';
 const AUTH_SESSION_KEY = 'badminton_auth_role';
+const AUTH_PIN_KEY = 'badminton_auth_pin';
+let _authPin = sessionStorage.getItem(AUTH_PIN_KEY); // sent with every save
 let currentRole = null; // 'super_admin' | 'admin' | 'guest'
 let _routingReady = false;
 
@@ -2023,19 +2029,37 @@ function clearPinError() {
   document.querySelectorAll('.pin-digit').forEach(d => d.classList.remove('error'));
 }
 
-function verifyPin() {
+function showPinError(msg) {
+  document.getElementById('authError').textContent = msg;
+  document.querySelectorAll('.pin-digit').forEach(d => { d.classList.add('error'); d.value = ''; });
+  document.querySelector('.pin-digit')?.focus();
+  updateSubmitBtn();
+}
+
+let _checkingPin = false;
+async function verifyPin() {
   const pin = getEnteredPin();
-  if (pin.length < 4) return;
-  if (pin === SUPER_ADMIN_PIN) {
-    setRole('super_admin');
-  } else if (pin === ADMIN_PIN) {
-    setRole('admin');
-  } else {
-    document.getElementById('authError').textContent = 'Incorrect PIN. Try again.';
-    document.querySelectorAll('.pin-digit').forEach(d => { d.classList.add('error'); d.value = ''; });
-    document.querySelector('.pin-digit')?.focus();
-    updateSubmitBtn();
+  if (pin.length < 4 || _checkingPin) return;
+  _checkingPin = true;
+  document.getElementById('authSubmitBtn').disabled = true;
+  let role = null;
+  try {
+    const backend = await _backendReady;
+    if (backend) role = await backend.checkPin(pin);
+    else role = pin === LOCAL_SUPER_ADMIN_PIN ? 'super_admin' : pin === LOCAL_ADMIN_PIN ? 'admin' : null;
+  } catch (e) {
+    console.warn('PIN check failed:', e);
+    showPinError(e.message || 'Could not check the PIN. Check your connection and try again.');
+    return;
+  } finally {
+    _checkingPin = false;
   }
+  if (!role) { showPinError('Incorrect PIN. Try again.'); return; }
+  _authPin = pin;
+  sessionStorage.setItem(AUTH_PIN_KEY, pin);
+  setRole(role);
+  // First admin to sign in creates the shared tournament if it doesn't exist yet
+  if (_syncEnabled && _remoteVersion === 0) pushState();
 }
 
 function enterAsGuest() {
@@ -2083,7 +2107,9 @@ function isSuperAdmin() { return currentRole === 'super_admin'; }
 
 function logout() {
   currentRole = null;
+  _authPin = null;
   sessionStorage.removeItem(AUTH_SESSION_KEY);
+  sessionStorage.removeItem(AUTH_PIN_KEY);
   document.body.classList.remove('guest-mode', 'super-admin-mode');
   document.getElementById('logoutBtn').style.display = 'none';
   document.getElementById('authGate').classList.remove('hidden');
@@ -2122,16 +2148,16 @@ const _supabaseClient = (function() {
 })();
 
 // Sync backends. Each one offers the same calls:
-//   get()                      -> { state, version } or null if none yet
-//   create(state)              -> stores version 1 (throws on failure)
-//   update(state, version)     -> new version, or null if someone else wrote first
+//   get()                -> { state, version } or null if none yet
+//   save(state, version) -> new version; null if someone else saved first;
+//                           -1 if the admin PIN was refused. version 0 creates.
+//   checkPin(pin)        -> 'super_admin' | 'admin' | null
 //   subscribe(onChange, onStatus)
 // The Wi-Fi server (server.js) is used when it served this page; otherwise
 // Supabase if configured; otherwise the app saves only in this browser.
 
 function wifiBackend() {
   const base = '/api/tournaments/' + encodeURIComponent(TOURNAMENT_ID);
-  const json = { 'Content-Type': 'application/json' };
   return {
     async get() {
       const r = await fetch(base, { cache: 'no-store' });
@@ -2139,15 +2165,24 @@ function wifiBackend() {
       if (!r.ok) throw new Error('Load failed: ' + r.status);
       return r.json();
     },
-    async create(st) {
-      const r = await fetch(base, { method: 'POST', headers: json, body: JSON.stringify({ state: st }) });
-      if (!r.ok) throw new Error('Create failed: ' + r.status);
-    },
-    async update(st, version) {
-      const r = await fetch(base, { method: 'PUT', headers: json, body: JSON.stringify({ state: st, version }) });
+    async save(st, version) {
+      const r = await fetch(base, {
+        method: version === 0 ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Pin': _authPin || '' },
+        body: JSON.stringify({ state: st, version }),
+      });
+      if (r.status === 401) return -1;
       if (r.status === 409) return null;
       if (!r.ok) throw new Error('Save failed: ' + r.status);
       return (await r.json()).version;
+    },
+    async checkPin(pin) {
+      const r = await fetch('/api/check-pin', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin }),
+      });
+      if (r.status === 429) throw new Error('Too many wrong PINs. Try again in 10 minutes.');
+      if (!r.ok) throw new Error('Could not check the PIN (' + r.status + ').');
+      return (await r.json()).role;
     },
     subscribe(onChange, onStatus) {
       // EventSource reconnects by itself and the server re-sends the latest copy.
@@ -2160,32 +2195,32 @@ function wifiBackend() {
 }
 
 function supabaseBackend(client) {
-  const table = () => client.from('tournaments');
   return {
     async get() {
-      const { data, error } = await table().select('state, version').eq('id', TOURNAMENT_ID).maybeSingle();
+      const { data, error } = await client.from('tournaments')
+        .select('state, version').eq('id', TOURNAMENT_ID).maybeSingle();
       if (error) throw error;
       return data;
     },
-    async create(st) {
-      const { error } = await table().insert({ id: TOURNAMENT_ID, state: st, version: 1 });
+    async save(st, version) {
+      // Checked inside the database: see supabase/setup.sql
+      const { data, error } = await client.rpc('save_tournament', {
+        p_id: TOURNAMENT_ID, p_state: st, p_version: version, p_pin: _authPin || '',
+      });
       if (error) throw error;
+      return data;
     },
-    async update(st, version) {
-      const { data, error } = await table()
-        .update({ state: st, version: version + 1, updated_at: new Date().toISOString() })
-        .eq('id', TOURNAMENT_ID)
-        .eq('version', version)
-        .select('version')
-        .single();
-      return (error || !data) ? null : data.version;
+    async checkPin(pin) {
+      const { data, error } = await client.rpc('check_pin', { p_pin: pin });
+      if (error) throw new Error(error.message);
+      return data;
     },
     subscribe(onChange, onStatus) {
       client
         .channel('tournament-' + TOURNAMENT_ID)
         .on('postgres_changes',
-          { event: 'UPDATE', schema: 'public', table: 'tournaments', filter: 'id=eq.' + TOURNAMENT_ID },
-          (payload) => onChange(payload.new.state, payload.new.version))
+          { event: '*', schema: 'public', table: 'tournaments', filter: 'id=eq.' + TOURNAMENT_ID },
+          (payload) => { if (payload.new && payload.new.state) onChange(payload.new.state, payload.new.version); })
         .subscribe((status) => {
           if (status === 'SUBSCRIBED') onStatus(true);
           else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') onStatus(false);
@@ -2209,6 +2244,7 @@ async function detectBackend() {
   }
   return _supabaseClient ? supabaseBackend(_supabaseClient) : null;
 }
+const _backendReady = detectBackend();
 
 // Sync state
 let _remoteVersion = 0;
@@ -2238,7 +2274,7 @@ function stateForSync() {
 }
 
 async function pushState() {
-  if (!_syncEnabled || !_backend) return;
+  if (!_syncEnabled || !_backend || !isAdmin() || !_authPin) return; // only admins save
   if (_pushing) {
     _pushQueue = true; // mark that another push is needed
     return;
@@ -2247,8 +2283,13 @@ async function pushState() {
   _pushQueue = null;
 
   try {
-    const version = await _backend.update(stateForSync(), _remoteVersion);
-    if (version === null) {
+    const version = await _backend.save(stateForSync(), _remoteVersion);
+    if (version === -1) {
+      // PIN changed or was wrong: sign out so the admin can sign in again
+      _unsynced = false;
+      toast('Your admin PIN was not accepted. Please sign in again.', 'error');
+      logout();
+    } else if (version === null) {
       // Version conflict — another client wrote first. Merge their state with
       // our newer per-match edits, then push again.
       console.warn('Sync conflict, merging remote state');
@@ -2343,7 +2384,7 @@ function subscribeToChanges() {
 }
 
 async function initSync() {
-  _backend = await detectBackend();
+  _backend = await _backendReady;
   if (!_backend) {
     // No sync configured — this browser only, so hide the badge
     const el = document.getElementById('syncBadge');
@@ -2357,10 +2398,11 @@ async function initSync() {
     const data = await _backend.get();
 
     if (!data) {
-      // Tournament doesn't exist yet — create from current local state
-      await _backend.create(stateForSync());
-      _remoteVersion = 1;
+      // Tournament doesn't exist yet. An admin creates it from the local copy
+      // (now, or when they sign in); viewers wait for it to appear.
+      _remoteVersion = 0;
       _syncEnabled = true;
+      if (isAdmin() && _authPin) pushState();
     } else {
       // Tournament exists — remote state wins
       const localUi = {

@@ -8,6 +8,15 @@ A single-file web app for managing doubles badminton tournaments with 30 players
 
 ## Quick Start
 
+### Put it online (GitHub Pages + Supabase)
+
+1. Create a free project at supabase.com.
+2. Open **SQL Editor → New query**, paste `supabase/setup.sql`, put your own 4-digit PINs in the last statement, and click **Run**.
+3. In **Project Settings → API**, copy the **Project URL** and the **anon public** key into `SUPABASE_URL` and `SUPABASE_ANON_KEY` in `index.html`. The anon key is safe to publish: it can only read tournaments and call the PIN-checked save function.
+4. In the GitHub repo, **Settings → Pages → Deploy from a branch → main / (root)**.
+
+Anyone with the link can view live. Only someone with an admin PIN can save; the PIN is checked inside the database, so it isn't in the page source. To change PINs later, edit and rerun just the last statement of `setup.sql`.
+
 ### Run it on phones over Wi-Fi (shared, live scores)
 
 Needs Node 18+ on the computer. No `npm install`.
@@ -16,7 +25,7 @@ Needs Node 18+ on the computer. No `npm install`.
 node server.js
 ```
 
-It prints a Wi-Fi address such as `http://192.168.1.23:8080`. Open that on any phone on the same Wi-Fi. Every phone shares one copy of the tournament and updates live; scores entered on two phones at once are merged. Data is saved in `data/` on the computer, so it survives restarts. Use `?t=<name>` to run more than one tournament (e.g. `?t=tuesday`).
+It prints a Wi-Fi address such as `http://192.168.1.23:8080`. Open that on any phone on the same Wi-Fi. Set your own admin PINs with `ADMIN_PIN=1234 SUPER_ADMIN_PIN=5678 node server.js`. Every phone shares one copy of the tournament and updates live; scores entered on two phones at once are merged. Data is saved in `data/` on the computer, so it survives restarts. Use `?t=<name>` to run more than one tournament (e.g. `?t=tuesday`).
 
 On a Mac, click **Allow** if asked whether Node may accept incoming connections.
 
